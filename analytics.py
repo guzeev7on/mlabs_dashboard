@@ -83,7 +83,7 @@ def parse_trades(raw: list) -> pd.DataFrame:
 
     # Side
     sdc = _first_col(df, "side")
-    out["side"] = df[sdc].str.upper() if sdc else "UNKNOWN"
+    out["side"] = df[sdc].astype(str).str.upper() if sdc else "UNKNOWN"
 
     return out.dropna(subset=["market_id"])
 
@@ -102,19 +102,88 @@ def apply_date_filter(df: pd.DataFrame, start: Date | None, end: Date | None) ->
 
 
 # ── Per-event analytics ───────────────────────────────────────────────────────
-#
-# For each event (market) the user may have traded several outcomes.
-# Intersection = min contracts across all outcomes  (guaranteed resolved units).
-# Profit = intersection × (Σ avg_prices − 1.0)
-#   • price_sum > 1 → net avg sell > $1 per pair → profit positive
-#   • price_sum < 1 → positions still cheap / net bought
-# ROI   = profit / (intersection × price_sum)
+
+def _fifo_match_outcome(trades: pd.DataFrame) -> dict:
+    long_lots: list[dict[str, float]] = []
+    short_lots: list[dict[str, float]] = []
+    realized_pnl = 0.0
+    matched_qty = 0.0
+    matched_volume = 0.0
+
+    for row in trades.sort_values(["timestamp", "date"]).itertuples():
+        side = str(row.side).upper()
+        qty = float(row.contracts)
+        price = float(row.price)
+        if qty <= 0 or np.isnan(qty) or np.isnan(price):
+            continue
+
+        if side == "BUY":
+            remaining = qty
+            while remaining > 1e-12 and short_lots:
+                lot = short_lots[0]
+                close_qty = min(remaining, lot["qty"])
+                realized_pnl += close_qty * (lot["price"] - price)
+                matched_qty += close_qty
+                matched_volume += close_qty * (lot["price"] + price)
+                lot["qty"] -= close_qty
+                remaining -= close_qty
+                if lot["qty"] <= 1e-12:
+                    short_lots.pop(0)
+            if remaining > 1e-12:
+                long_lots.append({"qty": remaining, "price": price})
+
+        elif side == "SELL":
+            remaining = qty
+            while remaining > 1e-12 and long_lots:
+                lot = long_lots[0]
+                close_qty = min(remaining, lot["qty"])
+                realized_pnl += close_qty * (price - lot["price"])
+                matched_qty += close_qty
+                matched_volume += close_qty * (lot["price"] + price)
+                lot["qty"] -= close_qty
+                remaining -= close_qty
+                if lot["qty"] <= 1e-12:
+                    long_lots.pop(0)
+            if remaining > 1e-12:
+                short_lots.append({"qty": remaining, "price": price})
+
+    return {
+        "realized_pnl": realized_pnl,
+        "matched_qty": matched_qty,
+        "matched_volume": matched_volume,
+        "long_lots": long_lots,
+        "short_lots": short_lots,
+    }
+
+
+def _consume_lots(lots: list[dict[str, float]], qty: float) -> tuple[float, float]:
+    remaining = qty
+    consumed_qty = 0.0
+    consumed_value = 0.0
+
+    for lot in lots:
+        if remaining <= 1e-12:
+            break
+        take_qty = min(remaining, lot["qty"])
+        consumed_qty += take_qty
+        consumed_value += take_qty * lot["price"]
+        remaining -= take_qty
+
+    return consumed_qty, consumed_value
+
+
+def _lot_qty(lots: list[dict[str, float]]) -> float:
+    return sum(lot["qty"] for lot in lots)
+
+
+def _lot_value(lots: list[dict[str, float]]) -> float:
+    return sum(lot["qty"] * lot["price"] for lot in lots)
 
 def event_analytics(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    needed = {"market_id", "outcome", "contracts", "price"}
+    needed = {"market_id", "outcome", "contracts", "price", "side"}
     if not needed.issubset(df.columns):
         return pd.DataFrame()
 
@@ -122,79 +191,136 @@ def event_analytics(df: pd.DataFrame) -> pd.DataFrame:
     if work.empty:
         return pd.DataFrame()
 
-    work["px_c"] = work["price"] * work["contracts"]
+    work["side"] = work["side"].astype(str).str.upper()
+    work = work[work["side"].isin(["BUY", "SELL"])].copy()
+    if work.empty:
+        return pd.DataFrame()
 
-    # Aggregate per market × outcome
-    agg = (
-        work.groupby(["market_id", "outcome"])
-        .agg(
-            title=("title", "first"),
-            slug=("slug", "first"),
-            total_contracts=("contracts", "sum"),
-            px_c_sum=("px_c", "sum"),
-            usdc_volume=("usdc_size", "sum"),
-            trade_count=("contracts", "count"),
-            last_date=("date", "max"),
-        )
-        .reset_index()
-    )
-    agg["avg_price"] = agg["px_c_sum"] / agg["total_contracts"]
+    work["trade_value"] = work["contracts"] * work["price"]
 
     rows = []
-    for market_id, grp in agg.groupby("market_id"):
+    for market_id, grp in work.groupby("market_id", sort=False):
         title = grp["title"].iloc[0]
         slug = grp["slug"].iloc[0]
-        outcomes = grp["outcome"].tolist()
-        vols = grp["total_contracts"].tolist()
-        prices = grp["avg_price"].tolist()
-        usdc_vols = grp["usdc_volume"].tolist()
-        last_date = grp["last_date"].max()
-        total_trades = grp["trade_count"].sum()
+        last_date = grp["date"].max()
+        total_contracts = grp["contracts"].sum()
+        total_usdc = grp["trade_value"].sum()
+        total_trades = len(grp)
 
-        total_vol = sum(vols)
-        total_usdc = sum(usdc_vols)
+        outcome_rows: list[dict] = []
+        realized_leg_pnl = 0.0
+        leg_matched_qty = 0.0
+        leg_matched_volume = 0.0
 
-        if len(outcomes) < 2:
-            # Single outcome — no intersection
-            detail = f"{outcomes[0]}: {vols[0]:.1f} @ {prices[0]:.4f}"
-            rows.append({
-                "market_id": market_id,
-                "title": title,
-                "slug": slug,
-                "outcomes_detail": detail,
-                "total_contracts": total_vol,
-                "total_usdc": total_usdc,
-                "intersection": 0.0,
-                "price_sum": prices[0],
-                "profit_usdc": 0.0,
-                "roi_pct": 0.0,
-                "trade_count": int(total_trades),
-                "last_date": last_date,
-                "n_outcomes": 1,
+        for outcome, outcome_grp in grp.groupby("outcome", sort=False):
+            matched = _fifo_match_outcome(outcome_grp)
+            realized_leg_pnl += matched["realized_pnl"]
+            leg_matched_qty += matched["matched_qty"]
+            leg_matched_volume += matched["matched_volume"]
+
+            buys = outcome_grp[outcome_grp["side"] == "BUY"]
+            sells = outcome_grp[outcome_grp["side"] == "SELL"]
+            buy_qty = buys["contracts"].sum()
+            sell_qty = sells["contracts"].sum()
+            buy_value = buys["trade_value"].sum()
+            sell_value = sells["trade_value"].sum()
+            long_qty = _lot_qty(matched["long_lots"])
+            short_qty = _lot_qty(matched["short_lots"])
+            long_value = _lot_value(matched["long_lots"])
+            short_value = _lot_value(matched["short_lots"])
+
+            outcome_rows.append({
+                "outcome": outcome,
+                "buy_qty": buy_qty,
+                "buy_value": buy_value,
+                "sell_qty": sell_qty,
+                "sell_value": sell_value,
+                "long_lots": matched["long_lots"],
+                "short_lots": matched["short_lots"],
+                "long_qty": long_qty,
+                "long_value": long_value,
+                "short_qty": short_qty,
+                "short_value": short_value,
             })
-            continue
 
-        intersection = min(vols)
-        price_sum = sum(prices)
-        profit = intersection * (price_sum - 1.0)
-        cost = intersection * price_sum
-        roi = (profit / cost * 100) if cost > 0 else 0.0
+        n_outcomes = len(outcome_rows)
+        complete_buy_qty = 0.0
+        complete_buy_cost = 0.0
+        complete_buy_pnl = 0.0
+        complete_buy_price_sum = np.nan
+        complete_sell_qty = 0.0
+        complete_sell_proceeds = 0.0
+        complete_sell_pnl = 0.0
+        complete_sell_price_sum = np.nan
 
-        detail_parts = [f"{o}: {v:.1f} @ {p:.4f}" for o, v, p in zip(outcomes, vols, prices)]
+        if n_outcomes >= 2:
+            complete_buy_qty = min(row["long_qty"] for row in outcome_rows)
+            if complete_buy_qty > 1e-12:
+                for row in outcome_rows:
+                    _, value = _consume_lots(row["long_lots"], complete_buy_qty)
+                    complete_buy_cost += value
+                complete_buy_pnl = complete_buy_qty - complete_buy_cost
+                complete_buy_price_sum = complete_buy_cost / complete_buy_qty
+
+            complete_sell_qty = min(row["short_qty"] for row in outcome_rows)
+            if complete_sell_qty > 1e-12:
+                for row in outcome_rows:
+                    _, value = _consume_lots(row["short_lots"], complete_sell_qty)
+                    complete_sell_proceeds += value
+                complete_sell_pnl = complete_sell_proceeds - complete_sell_qty
+                complete_sell_price_sum = complete_sell_proceeds / complete_sell_qty
+
+        complete_pnl = complete_buy_pnl + complete_sell_pnl
+        profit = realized_leg_pnl + complete_pnl
+        pnl_capital = complete_buy_cost + complete_sell_qty
+        roi = (profit / total_usdc * 100) if total_usdc > 0 else 0.0
+
+        detail_parts = []
+        unmatched_long_qty = 0.0
+        unmatched_short_qty = 0.0
+        for row in outcome_rows:
+            buy_avg = row["buy_value"] / row["buy_qty"] if row["buy_qty"] > 0 else np.nan
+            sell_avg = row["sell_value"] / row["sell_qty"] if row["sell_qty"] > 0 else np.nan
+            long_after_sets = max(row["long_qty"] - complete_buy_qty, 0.0)
+            short_after_sets = max(row["short_qty"] - complete_sell_qty, 0.0)
+            unmatched_long_qty += long_after_sets
+            unmatched_short_qty += short_after_sets
+            buy_txt = f"buy {row['buy_qty']:.1f} @ {buy_avg:.4f}" if row["buy_qty"] > 0 else "buy 0"
+            sell_txt = f"sell {row['sell_qty']:.1f} @ {sell_avg:.4f}" if row["sell_qty"] > 0 else "sell 0"
+            net_txt = f"net long {long_after_sets:.1f}" if long_after_sets > 1e-9 else ""
+            if short_after_sets > 1e-9:
+                net_txt = f"net short {short_after_sets:.1f}"
+            if not net_txt:
+                net_txt = "net flat"
+            detail_parts.append(f"{row['outcome']}: {buy_txt}, {sell_txt}, {net_txt}")
+
         rows.append({
             "market_id": market_id,
             "title": title,
             "slug": slug,
             "outcomes_detail": " | ".join(detail_parts),
-            "total_contracts": total_vol,
+            "total_contracts": total_contracts,
             "total_usdc": total_usdc,
-            "intersection": intersection,
-            "price_sum": price_sum,
+            "leg_matched_qty": leg_matched_qty,
+            "leg_matched_volume": leg_matched_volume,
+            "leg_pnl_usdc": realized_leg_pnl,
+            "complete_buy_qty": complete_buy_qty,
+            "complete_buy_price_sum": complete_buy_price_sum,
+            "complete_buy_pnl_usdc": complete_buy_pnl,
+            "complete_sell_qty": complete_sell_qty,
+            "complete_sell_price_sum": complete_sell_price_sum,
+            "complete_sell_pnl_usdc": complete_sell_pnl,
+            "complete_pnl_usdc": complete_pnl,
+            "pnl_capital": pnl_capital,
+            "unmatched_long_qty": unmatched_long_qty,
+            "unmatched_short_qty": unmatched_short_qty,
+            "intersection": complete_buy_qty + complete_sell_qty,
+            "price_sum": np.nan,
             "profit_usdc": profit,
             "roi_pct": roi,
             "trade_count": int(total_trades),
             "last_date": last_date,
-            "n_outcomes": len(outcomes),
+            "n_outcomes": n_outcomes,
         })
 
     result = pd.DataFrame(rows)
@@ -208,10 +334,14 @@ def event_analytics(df: pd.DataFrame) -> pd.DataFrame:
 def daily_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "date" not in df.columns:
         return pd.DataFrame()
+    work = df.dropna(subset=["contracts", "price"]).copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["trade_value"] = work["contracts"] * work["price"]
     d = (
-        df.groupby("date")
+        work.groupby("date")
         .agg(
-            usdc_volume=("usdc_size", "sum"),
+            usdc_volume=("trade_value", "sum"),
             contracts_traded=("contracts", "sum"),
             trade_count=("contracts", "count"),
         )
@@ -236,6 +366,89 @@ def parse_rebates(raw: list) -> pd.DataFrame:
     out["date"] = pd.to_datetime(ts, unit="s", utc=True).dt.normalize().dt.tz_localize(None)
     out["rebate_usdc"] = pd.to_numeric(df["usdcSize"], errors="coerce").fillna(0)
     return out.dropna(subset=["date"]).sort_values("date")
+
+
+def parse_closed_positions(raw: list) -> pd.DataFrame:
+    """Normalize Data API closed-position rows."""
+    if not raw:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(raw)
+    out = pd.DataFrame(index=df.index)
+    ts = pd.to_numeric(df.get("timestamp"), errors="coerce")
+    if ts.median() > 1e12:
+        ts = ts / 1000
+
+    out["timestamp"] = ts
+    out["date"] = pd.to_datetime(ts, unit="s", utc=True).dt.normalize().dt.tz_localize(None)
+    out["market_id"] = df.get("conditionId", "").astype(str)
+    out["title"] = df.get("title", "").astype(str)
+    out["slug"] = df.get("slug", "").astype(str)
+    out["event_slug"] = df.get("eventSlug", "").astype(str)
+    out["outcome"] = df.get("outcome", "").astype(str)
+    out["avg_price"] = pd.to_numeric(df.get("avgPrice"), errors="coerce")
+    out["total_bought"] = pd.to_numeric(df.get("totalBought"), errors="coerce").fillna(0)
+    out["realized_pnl"] = pd.to_numeric(df.get("realizedPnl"), errors="coerce").fillna(0)
+    out["resolved_price"] = pd.to_numeric(df.get("curPrice"), errors="coerce")
+    return out.dropna(subset=["date", "market_id", "resolved_price"])
+
+
+def expiration_analytics(closed_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate outcome-level closed positions into settled markets.
+
+    A closed position can also mean that the user sold out before resolution.
+    Exact 0/1 current prices distinguish markets that have actually settled.
+    """
+    if closed_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for market_id, grp in closed_df.groupby("market_id"):
+        prices = grp["resolved_price"].dropna()
+        if prices.empty or not prices.apply(lambda p: np.isclose(p, 0.0) or np.isclose(p, 1.0)).all():
+            continue
+
+        winners = grp.loc[np.isclose(grp["resolved_price"], 1.0), "outcome"].tolist()
+        details = [
+            f"{row.outcome}: settle {row.resolved_price:.0f}, PnL {row.realized_pnl:+.4f}"
+            for row in grp.itertuples()
+        ]
+        rows.append({
+            "market_id": market_id,
+            "date": grp["date"].max(),
+            "title": grp["title"].iloc[0],
+            "slug": grp["slug"].iloc[0],
+            "event_slug": grp["event_slug"].iloc[0],
+            "winner": ", ".join(winners) if winners else "Нет выигрышного исхода",
+            "expiration_pnl": grp["realized_pnl"].sum(),
+            "total_bought": grp["total_bought"].sum(),
+            "outcomes_detail": " | ".join(details),
+            "n_outcomes": len(grp),
+        })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("date").reset_index(drop=True)
+    return result
+
+
+def expiration_daily(expiration_df: pd.DataFrame) -> pd.DataFrame:
+    if expiration_df.empty:
+        return pd.DataFrame()
+    daily = (
+        expiration_df.groupby("date")
+        .agg(
+            daily_pnl=("expiration_pnl", "sum"),
+            events=("market_id", "count"),
+            profitable=("expiration_pnl", lambda s: int((s > 0).sum())),
+            losing=("expiration_pnl", lambda s: int((s < 0).sum())),
+        )
+        .reset_index()
+        .sort_values("date")
+    )
+    daily["cum_pnl"] = daily["daily_pnl"].cumsum()
+    return daily
 
 
 def rebate_daily(rebates_df: pd.DataFrame, trades_vol_df: pd.DataFrame) -> pd.DataFrame:
